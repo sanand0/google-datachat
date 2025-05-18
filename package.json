@@ -1,0 +1,21 @@
+{
+  "name": "google-datachat",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "tap run"
+  },
+  "prettier": {
+    "printWidth": 120
+  },
+  "type": "module",
+  "devDependencies": {
+    "tap": "^21.1.0",
+    "wrangler": "^4.15.2"
+  },
+  "dependencies": {
+    "jose": "^6.0.11"
+  }
+}

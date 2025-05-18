@@ -1,0 +1,7 @@
+name = "google-datachat"
+main = "worker.js"
+compatibility_date = "2025-05-18"
+
+# Disable workers logs in production. Enable it while testing
+[observability.logs]
+enabled = false
