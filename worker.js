@@ -5,17 +5,15 @@
  * - SERVICE_ACCOUNT_PRIVATE_KEY: Google Service Account private key (PEM format with newlines).
  */
 
+import { intentPrompt, answerPrompt, query } from "./config.js";
 import { SignJWT, importPKCS8 } from "jose";
 
 // In-memory cache for the access token
 let cachedAccessToken = null;
 let tokenExpiresAt = 0; // Timestamp (in milliseconds) when the token expires
 
-const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
-const GOOGLE_CHAT_SCOPE = "https://www.googleapis.com/auth/chat.bot";
-
 /** Generates/retrieves a Google Chat API access token using service account credentials and caches it. */
-async function getGoogleChatToken(env) {
+async function getToken(env) {
   const serviceAccount = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT);
 
   // Use cached token if valid (with a 1-minute buffer)
@@ -26,8 +24,8 @@ async function getGoogleChatToken(env) {
   const jwt = await new SignJWT({
     iss: serviceAccount.client_email,
     sub: serviceAccount.client_email,
-    aud: GOOGLE_TOKEN_URL,
-    scope: GOOGLE_CHAT_SCOPE,
+    aud: "https://oauth2.googleapis.com/token",
+    scope: "https://www.googleapis.com/auth/chat.bot https://www.googleapis.com/auth/bigquery.readonly",
     iat: now,
     // Google access tokens from JWT grant are valid for max 1 hour
     exp: now + 3600,
@@ -35,7 +33,7 @@ async function getGoogleChatToken(env) {
     .setProtectedHeader({ alg: "RS256", typ: "JWT", kid: serviceAccount.private_key_id })
     .sign(privateKey);
 
-  const tokenData = await fetch(GOOGLE_TOKEN_URL, {
+  const tokenData = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -57,29 +55,28 @@ async function handleRequest(request, env, ctx) {
   if (!request.headers.get("content-type")?.includes("application/json"))
     return new Response("Content-Type must be application/json", { status: 415 });
 
-  const { type, space, message } = await request.json();
+  const body = await request.json();
 
-  switch (type) {
+  switch (body.type) {
     case "ADDED_TO_SPACE":
-      return jsonResponse({ text: "Thanks for adding me! Ask a question." });
+      return jsonResponse({ text: "Thanks for adding me! #TODO explain what the app does." });
 
     case "REMOVED_FROM_SPACE":
       return jsonResponse(null);
 
     case "MESSAGE":
-      const userMessageText = message.text.trim();
       let apiToken;
       try {
-        apiToken = await getGoogleChatToken(env);
+        apiToken = await getToken(env);
       } catch (error) {
         return jsonResponse({ text: `ERROR: Could not obtain API token. ${error}` });
       }
 
-      ctx.waitUntil(processMessageEvent(apiToken, space.name, userMessageText));
-      return jsonResponse(null);
+      ctx.waitUntil(processMessageEvent(apiToken, body, env));
+      return new Response(null, { status: 204 });
 
     default:
-      return jsonResponse({ text: `ERROR: Received unknown event type: ${type}` });
+      return jsonResponse({ text: `ERROR: Received unknown event type: ${body.type}` });
   }
 }
 
@@ -89,23 +86,82 @@ function jsonResponse(data) {
   });
 }
 
-/** Processes a MESSAGE event: sends an initial message, waits 5s, then edits it. */
-async function processMessageEvent(apiToken, spaceName, userMessage) {
-  const chatApiBaseUrl = "https://chat.googleapis.com/v1";
-  const initialMessagePayload = { text: "Working on it..." };
-  const createMessageUrl = `${chatApiBaseUrl}/${spaceName}/messages`;
-  const { name } = await sendChat("POST", apiToken, createMessageUrl, initialMessagePayload);
+async function llm(body, env) {
+  const base_url = env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+  return await fetch(`${base_url}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+    body: JSON.stringify(body),
+  }).then((response) => response.json());
+}
 
-  const updatedMessagePayload = { text: `You asked: ${userMessage}` };
-  const editMessageUrl = `${chatApiBaseUrl}/${name}?updateMask=text`;
-  await sendChat("PATCH", apiToken, editMessageUrl, updatedMessagePayload);
+/** Processes a MESSAGE event: sends an initial message, waits 5s, then edits it. */
+async function processMessageEvent(apiToken, request, env) {
+  const chatApiBaseUrl = "https://chat.googleapis.com/v1";
+  const payload = { question: request.message.text, status: "Thinking..." };
+  const createMessageUrl = `${chatApiBaseUrl}/${request.space.name}/messages`;
+
+  const { name } = await sendChat("POST", apiToken, createMessageUrl, payload);
+  const editMessageUrl = `${chatApiBaseUrl}/${name}?updateMask=*`;
+
+  const body = {
+    model: "gpt-4.1-mini",
+    messages: [
+      { role: "system", content: intentPrompt },
+      { role: "user", content: request.message.text },
+    ],
+  };
+  const intent = await llm(body, env);
+  const response = intent.choices[0].message.content;
+
+  const sql = Array.from(response.matchAll(/```sql\s*([\s\S]*?)```/gi), (m) => m[1].trim()).join("\n");
+  payload.status = sql ? "Running query..." : "";
+
+  // Extract SQL code blocks and concatenate them
+  if (!sql) {
+    payload.status = "";
+    payload.answer = response;
+    await sendChat("PATCH", apiToken, editMessageUrl, payload);
+    return;
+  } else {
+    payload.status = "Running query...";
+    payload.sql = response;
+    await sendChat("PATCH", apiToken, editMessageUrl, payload);
+    let data;
+    try {
+      data = await query(apiToken, sql);
+      payload.status = `Fetched ${data.length} rows. Interpreting...`;
+      await sendChat("PATCH", apiToken, editMessageUrl, payload);
+    } catch (error) {
+      payload.status = "";
+      payload.error = error;
+      await sendChat("PATCH", apiToken, editMessageUrl, payload);
+      return;
+    }
+    const body = {
+      model: "gpt-4.1-nano",
+      messages: [{ role: "system", content: answerPrompt(JSON.stringify(data.slice(0, 1000)), request.message.text) }],
+    };
+    const answerResponse = await llm(body, env);
+    const answer = answerResponse.choices[0].message.content;
+    payload.status = "";
+    payload.answer = answer;
+    await sendChat("PATCH", apiToken, editMessageUrl, payload);
+  }
 }
 
 async function sendChat(method, apiToken, url, payload) {
+  const text = [`*🗨️ ${payload.question}*`, payload.status, payload.sql, payload.answer, payload.error]
+    .filter((d) => d)
+    .join("\n")
+    // Google Chat doesn't handle language markers for code fences
+    .replace(/```sql/g, "```")
+    // Google Chat uses * not ** for bold
+    .replace(/\*\*/g, "*");
   return await fetch(url, {
     method,
     headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ text, formattedText: text }),
   }).then((response) => response.json());
 }
 
